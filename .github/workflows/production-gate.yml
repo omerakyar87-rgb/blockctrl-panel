@@ -1,0 +1,105 @@
+name: Production Gate
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  migrate-test-build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Validate deploy credentials
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "::error::Missing required deploy secret: VERCEL_TOKEN"
+            exit 1
+          fi
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify or apply database migrations
+        shell: bash
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL || secrets.DATABASE_URL_UNPOOLED || secrets.DATABASE_URL }}
+          HEALTH_URL: ${{ vars.BLOCKCTRL_PUBLIC_URL || vars.NEXT_PUBLIC_APP_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MIGRATION_DATABASE_URL:-}" ]; then
+            pnpm db:migrate
+            exit 0
+          fi
+          if [ -z "${HEALTH_URL:-}" ]; then
+            echo "::error::MIGRATION_DATABASE_URL/DATABASE_URL_UNPOOLED/DATABASE_URL secret is missing and no BLOCKCTRL_PUBLIC_URL/NEXT_PUBLIC_APP_URL variable is available for migration verification."
+            exit 1
+          fi
+          health_url="${HEALTH_URL%/}/api/health"
+          body="$(curl -fsS --retry 3 --retry-delay 2 "$health_url")"
+          node -e 'const h=JSON.parse(process.argv[1]); if(h?.database?.status!=="ok"||h?.migration?.status!=="ok"){console.error("Production database/migration is not ready.",h?.migration);process.exit(1)}; console.log("Production DB verified:",h.migration.latest)' "$body"
+      - name: Quality gate
+        run: pnpm check
+      - name: Build panel
+        run: pnpm build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql://blockctrl:blockctrl@127.0.0.1:5432/blockctrl' }}
+          NEXT_PUBLIC_APP_URL: ${{ vars.NEXT_PUBLIC_APP_URL }}
+          BLOCKCTRL_PUBLIC_URL: ${{ vars.BLOCKCTRL_PUBLIC_URL }}
+          BLOCKCTRL_AUTO_MIGRATE: 'false'
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+      - name: Build agent
+        run: pnpm agent:build
+      - name: Install Vercel CLI
+        run: pnpm dlx vercel@latest --version
+      - name: Pull Vercel production configuration
+        run: pnpm dlx vercel@latest pull --yes --environment=production --token="${{ secrets.VERCEL_TOKEN }}"
+        env:
+          VERCEL_ORG_ID: team_zEq1EFLT8wmCCnkESQPGWhTO
+          VERCEL_PROJECT_ID: prj_Hif2b4E7LVk50tinTQwEhP0jt5cm
+      - name: Vercel production build
+        run: pnpm dlx vercel@latest build --prod --token="${{ secrets.VERCEL_TOKEN }}"
+        env:
+          VERCEL_ORG_ID: team_zEq1EFLT8wmCCnkESQPGWhTO
+          VERCEL_PROJECT_ID: prj_Hif2b4E7LVk50tinTQwEhP0jt5cm
+      - name: Deploy prebuilt production artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          url=$(pnpm dlx vercel@latest deploy --prebuilt --prod --yes --token="${{ secrets.VERCEL_TOKEN }}" | tail -n 1)
+          echo "DEPLOYMENT_URL=${url}" >> "${GITHUB_ENV}"
+        env:
+          VERCEL_ORG_ID: team_zEq1EFLT8wmCCnkESQPGWhTO
+          VERCEL_PROJECT_ID: prj_Hif2b4E7LVk50tinTQwEhP0jt5cm
+      - name: Production smoke test
+        run: pnpm test:e2e
+        env:
+          E2E_BASE_URL: ${{ env.DEPLOYMENT_URL }}
+          E2E_REQUIRE_READY: 'true'
