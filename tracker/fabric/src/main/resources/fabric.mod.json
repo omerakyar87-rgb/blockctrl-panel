@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "blockctrl_tracker",
+  "version": "${version}",
+  "name": "BlockCtrl Lost Item Tracker",
+  "description": "Server-side lost-item lifecycle tracker for BlockCtrl.",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "dev.blockctrl.tracker.BlockCtrlFabric"
+    ]
+  },
+  "mixins": [
+    "blockctrl-tracker.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.7",
+    "minecraft": "=1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
